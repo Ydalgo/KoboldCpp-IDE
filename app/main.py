@@ -1,4 +1,4 @@
-"""Dashboard web con tool calling + workspace y system prompt por sesión."""
+"""Dashboard web con tool calling + workspace + editor de archivos."""
 
 import json
 from contextlib import asynccontextmanager
@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from . import db
 from .kobold_client import KoboldClient
 from .tools import TOOL_SCHEMAS, execute_tool
+
 
 # ── Configuración global (defaults) ──────────────────────────
 CONFIG = {
@@ -63,6 +64,13 @@ def get_client() -> KoboldClient:
     return KoboldClient(CONFIG["base_url"], CONFIG["model"], CONFIG["api_key"])
 
 
+def _resolve_workspace(session_id: str) -> Path:
+    """Devuelve el workspace de una sesión, o el default."""
+    meta = None
+    # Necesitamos hacerlo sincrónico aquí, así que lo hacemos simple
+    return Path(DEFAULT_WORKSPACE)
+
+
 # ── Modelos Pydantic ─────────────────────────────────────────
 class ChatRequest(BaseModel):
     session_id: str
@@ -81,6 +89,12 @@ class ConfigUpdate(BaseModel):
 class SessionUpdate(BaseModel):
     workspace: str
     system_prompt: str
+
+
+class FileWrite(BaseModel):
+    session_id: str
+    path: str
+    content: str
 
 
 # ── Rutas básicas ────────────────────────────────────────────
@@ -113,6 +127,7 @@ async def set_config(cfg: ConfigUpdate):
     return {"ok": True, "config": CONFIG}
 
 
+# ── Sesiones ─────────────────────────────────────────────────
 @app.get("/api/sessions")
 async def sessions():
     return await db.list_sessions()
@@ -130,13 +145,23 @@ async def session_messages(session_id: str):
 
 @app.put("/api/sessions/{session_id}/meta")
 async def update_session_meta(session_id: str, payload: SessionUpdate):
-    # Validar workspace
     ws = Path(payload.workspace).expanduser().resolve()
     if not ws.exists() or not ws.is_dir():
         raise HTTPException(400, f"El workspace no existe o no es un directorio: {ws}")
     await db.upsert_session(session_id, str(ws), payload.system_prompt)
     return {"ok": True, "workspace": str(ws), "system_prompt": payload.system_prompt}
 
+class SessionRename(BaseModel):
+    name: str
+
+
+@app.put("/api/sessions/{session_id}/rename")
+async def rename_session_endpoint(session_id: str, payload: SessionRename):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(400, "El nombre no puede estar vacío")
+    await db.rename_session(session_id, name)
+    return {"ok": True, "name": name}
 
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str):
@@ -144,15 +169,134 @@ async def delete_session(session_id: str):
     return {"ok": True}
 
 
+# ── Gestor de archivos ───────────────────────────────────────
+IGNORE_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules",
+               ".aider.tags.cache.v4", ".pytest_cache", ".mypy_cache", ".idea", ".vscode"}
+
+
+async def _get_workspace(session_id: str) -> Path:
+    meta = await db.get_session_meta(session_id)
+    if not meta:
+        raise HTTPException(404, "Sesión no encontrada")
+    return Path(meta["workspace"]).resolve()
+
+
+def _check_sandbox(workspace: Path, target: Path):
+    if not str(target.resolve()).startswith(str(workspace)):
+        raise HTTPException(403, "Ruta fuera del workspace")
+
+
+@app.get("/api/files/tree")
+async def files_tree(session_id: str, path: str = "."):
+    workspace = await _get_workspace(session_id)
+    target = (workspace / path).resolve()
+    _check_sandbox(workspace, target)
+
+    if not target.exists():
+        raise HTTPException(404, "Ruta no existe")
+    if not target.is_dir():
+        raise HTTPException(400, "No es un directorio")
+
+    entries = []
+    try:
+        for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+            if child.name.startswith(".") and child.name not in {".gitignore", ".env.example"}:
+                continue
+            if child.name in IGNORE_DIRS:
+                continue
+            rel = child.relative_to(workspace)
+            entries.append({
+                "name": child.name,
+                "path": str(rel),
+                "type": "dir" if child.is_dir() else "file",
+                "size": child.stat().st_size if child.is_file() else None,
+            })
+    except PermissionError:
+        raise HTTPException(403, "Sin permisos para leer este directorio")
+
+    return {"path": path, "entries": entries}
+
+
+@app.get("/api/files/read")
+async def files_read(session_id: str, path: str):
+    workspace = await _get_workspace(session_id)
+    target = (workspace / path).resolve()
+    _check_sandbox(workspace, target)
+
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, "Archivo no existe")
+
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        raise HTTPException(500, f"Error leyendo archivo: {e}")
+
+    return {"path": path, "content": content}
+
+
+@app.post("/api/files/write")
+async def files_write(payload: FileWrite):
+    workspace = await _get_workspace(payload.session_id)
+    target = (workspace / payload.path).resolve()
+    _check_sandbox(workspace, target)
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(payload.content, encoding="utf-8")
+    except Exception as e:
+        raise HTTPException(500, f"Error escribiendo: {e}")
+
+    return {"ok": True, "path": payload.path, "bytes": len(payload.content)}
+
+# ── Explorador de directorios del sistema ────────────────────
+@app.get("/api/fs/browse")
+async def fs_browse(path: str = None):
+    """Lista los directorios de una ruta del sistema (solo directorios)."""
+    if not path:
+        path = str(Path.home())
+    target = Path(path).expanduser().resolve()
+
+    if not target.exists():
+        raise HTTPException(404, f"Ruta no existe: {target}")
+    if not target.is_dir():
+        raise HTTPException(400, f"No es un directorio: {target}")
+
+    entries = []
+    try:
+        for child in sorted(target.iterdir(), key=lambda p: p.name.lower()):
+            if not child.is_dir():
+                continue
+            # Saltamos carpetas ocultas y ruidosas
+            if child.name.startswith('.'):
+                continue
+            if child.name in {'.git', 'node_modules', '__pycache__', '.venv'}:
+                continue
+            entries.append({
+                "name": child.name,
+                "path": str(child),
+            })
+    except PermissionError:
+        raise HTTPException(403, f"Sin permisos para leer: {target}")
+
+    # Calcular el directorio padre (si no estamos en la raíz)
+    parent = None
+    if target.parent != target:
+        parent = str(target.parent)
+
+    return {
+        "path": str(target),
+        "parent": parent,
+        "home": str(Path.home()),
+        "entries": entries,
+    }
+    
 # ── Bucle agéntico ───────────────────────────────────────────
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    # Cargar metadatos de la sesión (o defaults)
     meta = await db.get_session_meta(req.session_id)
     workspace = Path(meta["workspace"]) if meta else Path(DEFAULT_WORKSPACE)
     system_prompt = meta["system_prompt"] if meta else DEFAULT_SYSTEM_PROMPT
 
-    # Si la sesión no tenía metadatos, los creamos ahora
     if not meta:
         await db.upsert_session(req.session_id, str(workspace), system_prompt)
 
@@ -215,3 +359,44 @@ async def chat(req: ChatRequest):
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
 
     return StreamingResponse(generator(), media_type="text/event-stream")
+
+
+# ── Explorador de directorios del sistema ────────────────────
+@app.get("/api/fs/browse")
+async def fs_browse(path: str = None):
+    """Lista los directorios de una ruta del sistema (solo directorios)."""
+    if not path:
+        path = str(Path.home())
+    target = Path(path).expanduser().resolve()
+
+    if not target.exists():
+        raise HTTPException(404, f"Ruta no existe: {target}")
+    if not target.is_dir():
+        raise HTTPException(400, f"No es un directorio: {target}")
+
+    entries = []
+    try:
+        for child in sorted(target.iterdir(), key=lambda p: p.name.lower()):
+            if not child.is_dir():
+                continue
+            if child.name.startswith('.'):
+                continue
+            if child.name in {'.git', 'node_modules', '__pycache__', '.venv'}:
+                continue
+            entries.append({
+                "name": child.name,
+                "path": str(child),
+            })
+    except PermissionError:
+        raise HTTPException(403, f"Sin permisos para leer: {target}")
+
+    parent = None
+    if target.parent != target:
+        parent = str(target.parent)
+
+    return {
+        "path": str(target),
+        "parent": parent,
+        "home": str(Path.home()),
+        "entries": entries,
+    }

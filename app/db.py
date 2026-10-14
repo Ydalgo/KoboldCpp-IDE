@@ -23,31 +23,49 @@ async def init_db():
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_session ON messages(session_id, id)
         """)
-        # Nueva tabla: metadatos por sesión
+        # Crear tabla sessions
         await db.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
                 workspace TEXT NOT NULL,
                 system_prompt TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
         """)
+
+        # Migración: si la tabla existía sin columna 'name', añadirla
+        cursor = await db.execute("PRAGMA table_info(sessions)")
+        columns = [row[1] for row in await cursor.fetchall()]
+        if 'name' not in columns:
+            await db.execute("ALTER TABLE sessions ADD COLUMN name TEXT NOT NULL DEFAULT ''")
+
         await db.commit()
 
 
-async def upsert_session(session_id: str, workspace: str, system_prompt: str):
+async def upsert_session(session_id: str, workspace: str, system_prompt: str, name: str = None):
     """Crea o actualiza los metadatos de una sesión."""
     now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
+        # Si la sesión ya existe y no se pasa name, mantener el actual
+        if name is None:
+            cursor = await db.execute(
+                "SELECT name FROM sessions WHERE session_id = ?",
+                (session_id,),
+            )
+            row = await cursor.fetchone()
+            name = row[0] if row else ''
+
         await db.execute("""
-            INSERT INTO sessions (session_id, workspace, system_prompt, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO sessions (session_id, name, workspace, system_prompt, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
+                name = excluded.name,
                 workspace = excluded.workspace,
                 system_prompt = excluded.system_prompt,
                 updated_at = excluded.updated_at
-        """, (session_id, workspace, system_prompt, now, now))
+        """, (session_id, name, workspace, system_prompt, now, now))
         await db.commit()
 
 
@@ -56,7 +74,7 @@ async def get_session_meta(session_id: str) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT workspace, system_prompt FROM sessions WHERE session_id = ?",
+            "SELECT name, workspace, system_prompt FROM sessions WHERE session_id = ?",
             (session_id,),
         )
         row = await cursor.fetchone()
@@ -85,11 +103,12 @@ async def get_messages(session_id: str, limit: int = 100):
 
 
 async def list_sessions():
-    """Lista todas las sesiones con preview + workspace."""
+    """Lista todas las sesiones con preview + workspace + name."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("""
             SELECT s.session_id,
+                   s.name,
                    s.workspace,
                    s.updated_at as started_at,
                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.session_id) as count,
@@ -107,4 +126,13 @@ async def delete_session(session_id: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
         await db.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        await db.commit()
+        
+async def rename_session(session_id: str, name: str):
+    """Renombra una sesión."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE sessions SET name = ?, updated_at = ? WHERE session_id = ?",
+            (name, datetime.utcnow().isoformat(), session_id),
+        )
         await db.commit()
