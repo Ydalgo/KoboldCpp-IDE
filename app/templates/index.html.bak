@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Agent Dashboard</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs/editor/editor.main.min.css">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body {
+            height: 100vh; overflow: hidden;
+            font-family: system-ui, -apple-system, sans-serif;
+            background: #1e1e1e; color: #e0e0e0; font-size: 13px;
+        }
+        .app {
+            display: grid;
+            grid-template-columns: 240px 4px 1fr 4px 380px;
+            height: 100vh;
+        }
+
+        /* Resizer (barra arrastrable) */
+        .resizer {
+            background: #333;
+            cursor: col-resize;
+            transition: background 0.15s;
+            position: relative;
+            user-select: none;
+        }
+        .resizer:hover, .resizer.dragging { background: #4ec9b0; }
+        .resizer::before {
+            content: '';
+            position: absolute;
+            top: 0; bottom: 0; left: -2px; right: -2px;
+            cursor: col-resize;
+        }
+
+        /* ── Sidebar ─────────────────────────────────── */
+        .sidebar {
+            background: #252526; border-right: 1px solid #333;
+            display: flex; flex-direction: column; overflow: hidden;
+            min-width: 0;
+        }
+        
+        .sidebar-header {
+            padding: 10px 12px; font-size: 11px; font-weight: 600;
+            color: #4ec9b0; text-transform: uppercase; letter-spacing: 0.5px;
+            border-bottom: 1px solid #333;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .sidebar-header button {
+            background: transparent; border: none; color: #888;
+            cursor: pointer; font-size: 14px; padding: 0 4px;
+        }
+        .sidebar-header button:hover { color: #4ec9b0; }
+        .file-tree { flex: 1; overflow-y: auto; padding: 4px 0; }
+        .tree-item {
+            padding: 3px 8px; cursor: pointer; font-size: 12.5px;
+            display: flex; align-items: center; gap: 6px;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .tree-item:hover { background: #2a2d2e; }
+        .tree-item.active { background: #094771; }
+        .tree-item .icon { color: #888; flex-shrink: 0; font-size: 12px; }
+        .tree-item.dir .icon { color: #dcb67a; }
+        .tree-item .name { overflow: hidden; text-overflow: ellipsis; }
+        .tree-children { display: none; }
+        .tree-children.open { display: block; }
+
+        /* ── Editor ──────────────────────────────────── */
+        .editor-area {
+            display: flex; flex-direction: column;
+            background: #1e1e1e; overflow: hidden;
+        }
+        .tabs {
+            display: flex; background: #252526;
+            border-bottom: 1px solid #333;
+            overflow-x: auto; overflow-y: hidden;
+            height: 35px; flex-shrink: 0;
+        }
+        .tab {
+            padding: 0 12px; height: 35px; line-height: 35px;
+            cursor: pointer; font-size: 12.5px;
+            border-right: 1px solid #333;
+            display: flex; align-items: center; gap: 8px;
+            white-space: nowrap; background: #2d2d30;
+        }
+        .tab.active { background: #1e1e1e; color: #fff; }
+        .tab .close { color: #888; font-size: 16px; line-height: 1; padding: 0 2px; }
+        .tab .close:hover { color: #f48771; }
+        .tab .dirty { color: #cca700; }
+        #editor { flex: 1; min-height: 0; }
+        .editor-status {
+            height: 22px; background: #007acc; color: white;
+            display: flex; align-items: center; padding: 0 10px;
+            font-size: 11px; gap: 12px; flex-shrink: 0;
+        }
+        .editor-status .dirty-badge {
+            background: #cca700; color: #000; padding: 1px 6px; border-radius: 3px;
+        }
+		.editor-status .save-btn {
+			background: #cca700;
+			color: #000;
+			border: none;
+			padding: 2px 10px;
+			border-radius: 3px;
+			font-size: 11px;
+			font-weight: 600;
+			cursor: pointer;
+			margin-left: 8px;
+			height: 18px;
+			line-height: 1;
+		}
+		.editor-status .save-btn:hover {
+			background: #e0b800;
+		}
+		.editor-status .save-btn:active {
+			background: #a88a00;
+		}
+        .editor-status .btn-toggle {
+            background: rgba(255,255,255,0.15);
+            color: white;
+            border: none;
+            padding: 1px 8px;
+            border-radius: 3px;
+            font-size: 11px;
+            cursor: pointer;
+            height: 18px;
+        }
+        .editor-status .btn-toggle:hover {
+            background: rgba(255,255,255,0.3);
+        }
+        /* ── Chat ────────────────────────────────────── */
+        .chat {
+            background: #252526; border-left: 1px solid #333;
+            display: flex; flex-direction: column; overflow: hidden;
+            min-width: 0;
+        }
+        .chat-header {
+            padding: 10px 12px; border-bottom: 1px solid #333;
+            display: flex; flex-direction: column; gap: 4px; font-size: 12px;
+        }
+        .chat-header .row1 { display: flex; align-items: center; gap: 8px; }
+        .chat-header .session-title {
+            font-weight: 500; flex: 1;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .chat-header .btn-small {
+            background: #444; border: none; color: #ddd;
+            padding: 3px 8px; border-radius: 3px;
+            cursor: pointer; font-size: 11px;
+        }
+        .chat-header .btn-small:hover { background: #555; }
+        .chat-header .session-workspace {
+            font-size: 10.5px; color: #888;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .chat-header .session-selector {
+            display: flex; align-items: center; gap: 4px; font-size: 11px;
+        }
+        .chat-header select {
+            background: #1e1e1e; color: #ddd; border: 1px solid #444;
+            border-radius: 3px; padding: 2px 4px; font-size: 11px; max-width: 150px;
+        }
+        .messages {
+            flex: 1; overflow-y: auto; padding: 10px;
+            display: flex; flex-direction: column; gap: 8px;
+        }
+        .msg {
+            max-width: 95%; padding: 8px 10px; border-radius: 6px;
+            white-space: pre-wrap; word-wrap: break-word;
+            font-size: 12.5px; line-height: 1.45;
+        }
+        .msg.user { background: #094771; align-self: flex-end; }
+        .msg.assistant { background: #2a2d2e; align-self: flex-start; }
+        .msg.error { background: #5a1d1d; align-self: center; font-size: 11px; }
+        .msg.tool-call {
+            background: #2d2a10; border-left: 3px solid #cca700;
+            align-self: flex-start; font-size: 11px; max-width: 95%;
+            padding: 5px 8px; font-family: ui-monospace, monospace;
+        }
+        .msg.tool-call.tool-ok { border-left-color: #4ec9b0; }
+        .msg.tool-call.tool-error { border-left-color: #f48771; }
+        .msg.tool-call .args { color: #888; margin-left: 6px; }
+        .msg.tool-call .tool-result { margin-left: 6px; }
+        .input-area {
+            padding: 8px; border-top: 1px solid #333;
+            display: flex; gap: 6px;
+        }
+        .input-area textarea {
+            flex: 1; background: #1e1e1e; color: #e0e0e0;
+            border: 1px solid #444; border-radius: 4px;
+            padding: 8px; font-family: inherit; font-size: 12.5px;
+            resize: none; height: 50px;
+        }
+        .input-area textarea:focus { outline: none; border-color: #0e639c; }
+        .input-area button {
+            padding: 0 14px; background: #0e639c; color: white;
+            border: none; border-radius: 4px; cursor: pointer;
+            font-size: 12.5px; font-weight: 500;
+        }
+        .input-area button:hover { background: #1177bb; }
+        .input-area button:disabled { background: #555; cursor: not-allowed; }
+
+        /* ── Modal ───────────────────────────────────── */
+        .modal {
+            display: none; position: fixed; inset: 0;
+            background: rgba(0,0,0,0.7); align-items: center;
+            justify-content: center; z-index: 100;
+        }
+        .modal.open { display: flex; }
+        .modal-content {
+            background: #252526; padding: 20px; border-radius: 8px;
+            width: 90%; max-width: 700px; max-height: 90vh; overflow-y: auto;
+            border: 1px solid #444;
+        }
+        .modal-content h2 { margin-bottom: 14px; font-size: 15px; color: #4ec9b0; }
+        .modal-content label {
+            display: block; margin-bottom: 4px; font-size: 11px;
+            color: #888; margin-top: 10px;
+        }
+        .modal-content input, .modal-content textarea {
+            width: 100%; padding: 7px 9px; background: #1e1e1e;
+            color: #e0e0e0; border: 1px solid #444; border-radius: 4px;
+            font-size: 12.5px; font-family: inherit;
+        }
+        .modal-content textarea { min-height: 180px; resize: vertical; }
+        .modal-content button {
+            padding: 7px 14px; background: #0e639c; color: white;
+            border: none; border-radius: 4px; cursor: pointer;
+            margin-right: 6px; margin-top: 14px; font-size: 12.5px;
+        }
+        .modal-content button.secondary { background: #555; }
+        .status-dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: #666; display: inline-block;
+        }
+        .status-dot.ok { background: #4ec9b0; }
+        .status-dot.error { background: #f48771; }
+    </style>
+</head>
+<body>
+    <div class="app" id="app">
+        <!-- Sidebar: árbol de archivos -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <span>Explorador</span>
+                <div style="display:flex;gap:2px">
+                    <button onclick="refreshTree()" title="Refrescar">↻</button>
+                    <button onclick="togglePanel('explorer')" title="Ocultar">◀</button>
+                </div>
+            </div>
+            <div class="file-tree" id="file-tree">
+                <div style="padding:12px;color:#666;font-size:11px">Sin sesión activa</div>
+            </div>
+        </aside>
+
+        <!-- Resizer izquierdo -->
+        <div class="resizer resizer-left" id="resizer-left"></div>
+
+        <!-- Centro: editor -->
+        <main class="editor-area">
+            <div class="tabs" id="tabs"></div>
+            <div id="editor"></div>
+            <div class="editor-status">
+                <button id="btn-show-explorer" class="btn-toggle" onclick="togglePanel('explorer')" title="Mostrar explorador" style="display:none">▶ 📁</button>
+                <span id="status-file">Sin archivo abierto</span>
+                <span id="status-dirty" style="display:none" class="dirty-badge">● modificado</span>
+                <span style="margin-left:auto" id="status-lang"></span>
+                <button id="btn-save" class="save-btn" style="display:none" onclick="saveCurrentFile()" title="Guardar archivo (Ctrl+S)">💾 Guardar</button>
+                <button id="btn-show-chat" class="btn-toggle" onclick="togglePanel('chat')" title="Mostrar chat" style="display:none">💬 ◀</button>
+            </div>
+        </main>
+
+        <!-- Resizer derecho -->
+        <div class="resizer resizer-right" id="resizer-right"></div>
+
+        <!-- Derecha: chat -->
+        <aside class="chat">
+            <div class="chat-header">
+                <div class="row1">
+                    <span class="session-title" id="session-title">—</span>
+                    <button class="btn-small" onclick="renameCurrentSession()" title="Renombrar sesión">✏️</button>
+                    <button class="btn-small" onclick="newSession()" title="Nueva sesión">+</button>
+                    <button class="btn-small" onclick="openSessionConfig()" title="Workspace y prompt">⚙</button>
+                    <button class="btn-small" onclick="openLLMConfig()" title="Configurar LLM">🔧</button>
+                    <button class="btn-small" onclick="togglePanel('chat')" title="Ocultar chat">▶</button>
+                </div>
+                <div class="session-selector">
+                    <label>Sesión:</label>
+                    <select id="session-select" onchange="onSessionSelect(this.value)"></select>
+                </div>
+                <div class="session-workspace" id="session-workspace"></div>
+                <div style="font-size:10.5px;color:#888;display:flex;gap:8px;align-items:center">
+                    <span id="status-dot" class="status-dot"></span>
+                    <span id="status-text">Conectando…</span>
+                </div>
+            </div>
+            <div class="messages" id="messages"></div>
+            <div class="input-area">
+                <textarea id="input" placeholder="Escribe al agente… (Enter envía, Shift+Enter nueva línea)"></textarea>
+                <button id="send" onclick="send()">Enviar</button>
+            </div>
+        </aside>
+    </div>
+
+    <!-- Modal: Configuración LLM -->
+    <div class="modal" id="config-modal">
+        <div class="modal-content">
+            <h2>⚙ Configuración del LLM</h2>
+            <label>Base URL</label>
+            <input id="cfg-base-url" />
+            <label>Modelo</label>
+            <input id="cfg-model" />
+            <label>API Key</label>
+            <input id="cfg-api-key" />
+            <label>Temperature</label>
+            <input id="cfg-temperature" type="number" step="0.1" min="0" max="2" />
+            <label>Max Tokens</label>
+            <input id="cfg-max-tokens" type="number" min="1" />
+            <button onclick="saveLLMConfig()">Guardar</button>
+            <button class="secondary" onclick="closeLLMConfig()">Cancelar</button>
+        </div>
+    </div>
+
+    <!-- Modal: Workspace + System Prompt -->
+    <div class="modal" id="session-modal">
+        <div class="modal-content">
+            <h2>📁 Workspace y Prompt del sistema</h2>
+            <label>Directorio de trabajo</label>
+            <div style="display:flex;gap:6px">
+                <input id="sess-workspace" placeholder="/home/usuario/proyectos/pnt" style="flex:1" />
+                <button type="button" onclick="openFsBrowser()" title="Explorar carpetas" style="padding:0 12px;margin:0;background:#444;color:#ddd;border:none;border-radius:4px;cursor:pointer">📁</button>
+            </div>
+            <label>System Prompt (prompt madre)</label>
+            <textarea id="sess-prompt"></textarea>
+            <button onclick="saveSessionConfig()">Guardar</button>
+            <button class="secondary" onclick="closeSessionConfig()">Cancelar</button>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs/loader.js"></script>
+    <!-- Modal: Explorador de carpetas del sistema -->
+    <div class="modal" id="fs-modal">
+        <div class="modal-content" style="max-width:600px">
+            <h2>📂 Seleccionar carpeta</h2>
+            <div style="display:flex;gap:6px;margin-bottom:10px;align-items:center">
+                <button type="button" onclick="fsGoHome()" title="Ir al home" style="padding:4px 10px;margin:0;background:#444;color:#ddd;border:none;border-radius:3px;cursor:pointer;font-size:12px">🏠</button>
+                <button type="button" onclick="fsGoUp()" title="Subir un nivel" style="padding:4px 10px;margin:0;background:#444;color:#ddd;border:none;border-radius:3px;cursor:pointer;font-size:12px">⬆</button>
+                <input id="fs-path" type="text" style="flex:1" readonly />
+                <button type="button" onclick="fsRefresh()" title="Refrescar" style="padding:4px 10px;margin:0;background:#444;color:#ddd;border:none;border-radius:3px;cursor:pointer;font-size:12px">↻</button>
+            </div>
+            <div id="fs-list" style="max-height:400px;overflow-y:auto;background:#1e1e1e;border:1px solid #444;border-radius:4px;padding:4px"></div>
+            <div style="margin-top:14px">
+                <button onclick="fsSelectCurrent()">Usar esta carpeta</button>
+                <button class="secondary" onclick="closeFsBrowser()">Cancelar</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs/loader.js"></script>
+    <script src="/static/app.js"></script>
+</body>
+</html>

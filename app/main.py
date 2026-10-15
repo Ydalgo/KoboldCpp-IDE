@@ -1,4 +1,4 @@
-"""Dashboard web con tool calling + workspace + editor de archivos."""
+"""Dashboard web con tool calling, proyectos y sesiones."""
 
 import json
 from contextlib import asynccontextmanager
@@ -24,8 +24,6 @@ CONFIG = {
     "max_tokens": 2048,
     "max_iterations": 15,
 }
-
-DEFAULT_WORKSPACE = str(Path.home() / "proyectos" / "pnt")
 
 DEFAULT_SYSTEM_PROMPT = """Eres un desarrollador senior trabajando en un proyecto de software.
 
@@ -64,19 +62,7 @@ def get_client() -> KoboldClient:
     return KoboldClient(CONFIG["base_url"], CONFIG["model"], CONFIG["api_key"])
 
 
-def _resolve_workspace(session_id: str) -> Path:
-    """Devuelve el workspace de una sesión, o el default."""
-    meta = None
-    # Necesitamos hacerlo sincrónico aquí, así que lo hacemos simple
-    return Path(DEFAULT_WORKSPACE)
-
-
 # ── Modelos Pydantic ─────────────────────────────────────────
-class ChatRequest(BaseModel):
-    session_id: str
-    message: str
-
-
 class ConfigUpdate(BaseModel):
     base_url: str
     model: str
@@ -86,9 +72,36 @@ class ConfigUpdate(BaseModel):
     max_iterations: int = 15
 
 
+class ProjectCreate(BaseModel):
+    name: str | None = None
+    path: str
+    color: str | None = None
+
+
+class ProjectUpdate(BaseModel):
+    name: str | None = None
+    color: str | None = None
+
+
+class SessionCreate(BaseModel):
+    session_id: str | None = None
+    name: str | None = None
+    project_id: int | None = None
+    project_path: str | None = None       # alternativa: crear/asociar por path
+    system_prompt: str | None = None
+
+
 class SessionUpdate(BaseModel):
-    workspace: str
-    system_prompt: str
+    name: str | None = None
+    project_id: int | None = None
+    project_path: str | None = None
+    clear_project: bool = False           # para desasociar
+    system_prompt: str | None = None
+
+
+class ChatRequest(BaseModel):
+    session_id: str
+    message: str
 
 
 class FileWrite(BaseModel):
@@ -116,7 +129,6 @@ async def status():
 async def get_config():
     return {
         **CONFIG,
-        "default_workspace": DEFAULT_WORKSPACE,
         "default_system_prompt": DEFAULT_SYSTEM_PROMPT,
     }
 
@@ -127,41 +139,136 @@ async def set_config(cfg: ConfigUpdate):
     return {"ok": True, "config": CONFIG}
 
 
+# ── Proyectos ────────────────────────────────────────────────
+@app.get("/api/projects")
+async def list_projects():
+    return await db.list_projects()
+
+
+@app.post("/api/projects")
+async def create_project(payload: ProjectCreate):
+    path = str(Path(payload.path).expanduser().resolve())
+    if not Path(path).exists() or not Path(path).is_dir():
+        raise HTTPException(400, f"La ruta no existe o no es un directorio: {path}")
+
+    # Si ya existe por path, devolver el existente
+    existing = await db.get_project_by_path(path)
+    if existing:
+        return existing
+
+    name = payload.name or Path(path).name or path
+    return await db.create_project(name, path, payload.color or "#4ec9b0")
+
+
+@app.get("/api/projects/{project_id}")
+async def get_project(project_id: int):
+    p = await db.get_project(project_id)
+    if not p:
+        raise HTTPException(404, "Proyecto no encontrado")
+    return p
+
+
+@app.put("/api/projects/{project_id}")
+async def update_project(project_id: int, payload: ProjectUpdate):
+    p = await db.update_project(project_id, name=payload.name, color=payload.color)
+    if not p:
+        raise HTTPException(404, "Proyecto no encontrado")
+    return p
+
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: int):
+    await db.delete_project(project_id)
+    return {"ok": True}
+
+
+@app.get("/api/projects/{project_id}/sessions")
+async def list_project_sessions(project_id: int):
+    return await db.list_sessions_by_project(project_id)
+
+
 # ── Sesiones ─────────────────────────────────────────────────
 @app.get("/api/sessions")
-async def sessions():
+async def list_sessions():
     return await db.list_sessions()
 
 
+@app.post("/api/sessions")
+async def create_session(payload: SessionCreate):
+    # Resolver project_id
+    project_id = payload.project_id
+    if project_id is None and payload.project_path:
+        path = str(Path(payload.project_path).expanduser().resolve())
+        if not Path(path).exists() or not Path(path).is_dir():
+            raise HTTPException(400, f"La ruta del proyecto no existe: {path}")
+        project = await db.get_or_create_project(path)
+        project_id = project["id"]
+    elif project_id is not None:
+        # Verificar que existe
+        project = await db.get_project(project_id)
+        if not project:
+            raise HTTPException(404, "Proyecto no encontrado")
+
+    # session_id
+    import time
+    session_id = payload.session_id or f"sess-{int(time.time() * 1000)}"
+
+    name = payload.name or ""
+    system_prompt = payload.system_prompt or DEFAULT_SYSTEM_PROMPT
+
+    session = await db.create_session(
+        session_id=session_id,
+        name=name,
+        project_id=project_id,
+        system_prompt=system_prompt,
+    )
+    return session
+
+
 @app.get("/api/sessions/{session_id}")
-async def session_messages(session_id: str):
+async def get_session(session_id: str):
+    s = await db.get_session(session_id)
+    if not s:
+        raise HTTPException(404, "Sesión no encontrada")
     messages = await db.get_messages(session_id)
-    meta = await db.get_session_meta(session_id) or {
-        "workspace": DEFAULT_WORKSPACE,
-        "system_prompt": DEFAULT_SYSTEM_PROMPT,
-    }
-    return {"messages": messages, "meta": meta}
+    return {"session": s, "messages": messages}
 
 
-@app.put("/api/sessions/{session_id}/meta")
-async def update_session_meta(session_id: str, payload: SessionUpdate):
-    ws = Path(payload.workspace).expanduser().resolve()
-    if not ws.exists() or not ws.is_dir():
-        raise HTTPException(400, f"El workspace no existe o no es un directorio: {ws}")
-    await db.upsert_session(session_id, str(ws), payload.system_prompt)
-    return {"ok": True, "workspace": str(ws), "system_prompt": payload.system_prompt}
+@app.put("/api/sessions/{session_id}")
+async def update_session(session_id: str, payload: SessionUpdate):
+    s = await db.get_session(session_id)
+    if not s:
+        raise HTTPException(404, "Sesión no encontrada")
 
-class SessionRename(BaseModel):
-    name: str
+    # Resolver project_id si viene por path
+    project_id = payload.project_id
+    set_project = False
 
+    if payload.clear_project:
+        project_id = None
+        set_project = True
+    elif payload.project_path:
+        path = str(Path(payload.project_path).expanduser().resolve())
+        if not Path(path).exists() or not Path(path).is_dir():
+            raise HTTPException(400, f"La ruta del proyecto no existe: {path}")
+        project = await db.get_or_create_project(path)
+        project_id = project["id"]
+        set_project = True
+    elif project_id is not None:
+        project = await db.get_project(project_id)
+        if not project:
+            raise HTTPException(404, "Proyecto no encontrado")
+        set_project = True
 
-@app.put("/api/sessions/{session_id}/rename")
-async def rename_session_endpoint(session_id: str, payload: SessionRename):
-    name = payload.name.strip()
-    if not name:
-        raise HTTPException(400, "El nombre no puede estar vacío")
-    await db.rename_session(session_id, name)
-    return {"ok": True, "name": name}
+    updated = await db.update_session(
+        session_id,
+        name=payload.name,
+        project_id=project_id,
+        set_project=set_project,
+        system_prompt=payload.system_prompt,
+    )
+    return updated
+
 
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str):
@@ -174,11 +281,14 @@ IGNORE_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules",
                ".aider.tags.cache.v4", ".pytest_cache", ".mypy_cache", ".idea", ".vscode"}
 
 
-async def _get_workspace(session_id: str) -> Path:
-    meta = await db.get_session_meta(session_id)
-    if not meta:
+async def _get_session_workspace(session_id: str) -> Path | None:
+    """Devuelve la ruta del workspace de la sesión (via proyecto), o None."""
+    s = await db.get_session(session_id)
+    if not s:
         raise HTTPException(404, "Sesión no encontrada")
-    return Path(meta["workspace"]).resolve()
+    if not s.get("project_path"):
+        return None
+    return Path(s["project_path"]).resolve()
 
 
 def _check_sandbox(workspace: Path, target: Path):
@@ -188,7 +298,10 @@ def _check_sandbox(workspace: Path, target: Path):
 
 @app.get("/api/files/tree")
 async def files_tree(session_id: str, path: str = "."):
-    workspace = await _get_workspace(session_id)
+    workspace = await _get_session_workspace(session_id)
+    if workspace is None:
+        raise HTTPException(400, "La sesión no tiene proyecto asignado")
+
     target = (workspace / path).resolve()
     _check_sandbox(workspace, target)
 
@@ -219,7 +332,10 @@ async def files_tree(session_id: str, path: str = "."):
 
 @app.get("/api/files/read")
 async def files_read(session_id: str, path: str):
-    workspace = await _get_workspace(session_id)
+    workspace = await _get_session_workspace(session_id)
+    if workspace is None:
+        raise HTTPException(400, "La sesión no tiene proyecto asignado")
+
     target = (workspace / path).resolve()
     _check_sandbox(workspace, target)
 
@@ -236,7 +352,10 @@ async def files_read(session_id: str, path: str):
 
 @app.post("/api/files/write")
 async def files_write(payload: FileWrite):
-    workspace = await _get_workspace(payload.session_id)
+    workspace = await _get_session_workspace(payload.session_id)
+    if workspace is None:
+        raise HTTPException(400, "La sesión no tiene proyecto asignado")
+
     target = (workspace / payload.path).resolve()
     _check_sandbox(workspace, target)
 
@@ -248,10 +367,10 @@ async def files_write(payload: FileWrite):
 
     return {"ok": True, "path": payload.path, "bytes": len(payload.content)}
 
-# ── Explorador de directorios del sistema ────────────────────
+
+# ── Explorador de carpetas del sistema ───────────────────────
 @app.get("/api/fs/browse")
 async def fs_browse(path: str = None):
-    """Lista los directorios de una ruta del sistema (solo directorios)."""
     if not path:
         path = str(Path.home())
     target = Path(path).expanduser().resolve()
@@ -266,7 +385,6 @@ async def fs_browse(path: str = None):
         for child in sorted(target.iterdir(), key=lambda p: p.name.lower()):
             if not child.is_dir():
                 continue
-            # Saltamos carpetas ocultas y ruidosas
             if child.name.startswith('.'):
                 continue
             if child.name in {'.git', 'node_modules', '__pycache__', '.venv'}:
@@ -278,7 +396,6 @@ async def fs_browse(path: str = None):
     except PermissionError:
         raise HTTPException(403, f"Sin permisos para leer: {target}")
 
-    # Calcular el directorio padre (si no estamos en la raíz)
     parent = None
     if target.parent != target:
         parent = str(target.parent)
@@ -289,16 +406,20 @@ async def fs_browse(path: str = None):
         "home": str(Path.home()),
         "entries": entries,
     }
-    
+
+
 # ── Bucle agéntico ───────────────────────────────────────────
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    meta = await db.get_session_meta(req.session_id)
-    workspace = Path(meta["workspace"]) if meta else Path(DEFAULT_WORKSPACE)
-    system_prompt = meta["system_prompt"] if meta else DEFAULT_SYSTEM_PROMPT
+    session = await db.get_session(req.session_id)
+    if not session:
+        raise HTTPException(404, "Sesión no encontrada")
 
-    if not meta:
-        await db.upsert_session(req.session_id, str(workspace), system_prompt)
+    workspace: Path | None = None
+    if session.get("project_path"):
+        workspace = Path(session["project_path"]).resolve()
+
+    system_prompt = session.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
 
     await db.save_message(req.session_id, "user", req.message)
     history = await db.get_messages(req.session_id)
@@ -341,8 +462,13 @@ async def chat(req: ChatRequest):
                     except json.JSONDecodeError:
                         args = {}
 
+                    # Si no hay workspace, rechazar herramientas que lo necesiten
+                    if workspace is None and name in {"read_file", "write_file", "list_dir", "run_command"}:
+                        result = {"error": "Esta sesión no tiene proyecto asignado. No puedo ejecutar herramientas de archivos/comandos."}
+                    else:
+                        result = execute_tool(workspace, name, args)
+
                     yield f"data: {json.dumps({'type': 'tool_call', 'name': name, 'args': args})}\n\n"
-                    result = execute_tool(workspace, name, args)
                     yield f"data: {json.dumps({'type': 'tool_result', 'name': name, 'result': result})}\n\n"
 
                     messages.append({
@@ -359,44 +485,3 @@ async def chat(req: ChatRequest):
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
 
     return StreamingResponse(generator(), media_type="text/event-stream")
-
-
-# ── Explorador de directorios del sistema ────────────────────
-@app.get("/api/fs/browse")
-async def fs_browse(path: str = None):
-    """Lista los directorios de una ruta del sistema (solo directorios)."""
-    if not path:
-        path = str(Path.home())
-    target = Path(path).expanduser().resolve()
-
-    if not target.exists():
-        raise HTTPException(404, f"Ruta no existe: {target}")
-    if not target.is_dir():
-        raise HTTPException(400, f"No es un directorio: {target}")
-
-    entries = []
-    try:
-        for child in sorted(target.iterdir(), key=lambda p: p.name.lower()):
-            if not child.is_dir():
-                continue
-            if child.name.startswith('.'):
-                continue
-            if child.name in {'.git', 'node_modules', '__pycache__', '.venv'}:
-                continue
-            entries.append({
-                "name": child.name,
-                "path": str(child),
-            })
-    except PermissionError:
-        raise HTTPException(403, f"Sin permisos para leer: {target}")
-
-    parent = None
-    if target.parent != target:
-        parent = str(target.parent)
-
-    return {
-        "path": str(target),
-        "parent": parent,
-        "home": str(Path.home()),
-        "entries": entries,
-    }

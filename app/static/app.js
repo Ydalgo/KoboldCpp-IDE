@@ -1,15 +1,29 @@
 // ══════════════════════════════════════════════════════════════
 //  Estado global
 // ══════════════════════════════════════════════════════════════
-let currentSession = null;
+let currentSession = null;      // Objeto sesión completo (con project info)
+let currentProject = null;      // Objeto proyecto activo
+let allProjects = [];           // Lista de proyectos
+let allSessions = [];           // Lista de sesiones
 let isStreaming = false;
 let editor = null;
 let openTabs = [];
 let activeTabPath = null;
 
 // ══════════════════════════════════════════════════════════════
-//  Detección de lenguaje
+//  Utilidades
 // ══════════════════════════════════════════════════════════════
+function escapeHtml(s) {
+    const d = document.createElement('div');
+    d.textContent = s == null ? '' : String(s);
+    return d.innerHTML;
+}
+
+function scrollDown() {
+    const m = document.getElementById('messages');
+    if (m) m.scrollTop = m.scrollHeight;
+}
+
 function detectLang(path) {
     if (!path) return 'plaintext';
     const ext = path.split('.').pop().toLowerCase();
@@ -22,6 +36,19 @@ function detectLang(path) {
         txt: 'plaintext', gitignore: 'plaintext',
     };
     return map[ext] || 'plaintext';
+}
+
+function formatDate(iso) {
+    if (!iso) return '';
+    try {
+        const d = new Date(iso);
+        return d.toLocaleString('es-ES', {
+            day: '2-digit', month: '2-digit',
+            hour: '2-digit', minute: '2-digit'
+        });
+    } catch (e) {
+        return iso;
+    }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -59,18 +86,28 @@ require(['vs/editor/editor.main'], function () {
 });
 
 // ══════════════════════════════════════════════════════════════
-//  Árbol de archivos
+//  Árbol de archivos (workspace del proyecto actual)
 // ══════════════════════════════════════════════════════════════
 async function refreshTree() {
     const container = document.getElementById('file-tree');
+    if (!container) return;
+
     if (!currentSession) {
-        container.innerHTML = '<div style="padding:12px;color:#666;font-size:11px">Sin sesión activa</div>';
+        container.innerHTML = '<div style="padding:12px;color:#666;font-size:11px">Selecciona o crea una sesión</div>';
         return;
     }
+    if (!currentProject) {
+        container.innerHTML = '<div style="padding:12px;color:#666;font-size:11px">Esta sesión no tiene proyecto asignado</div>';
+        return;
+    }
+
     container.innerHTML = '<div style="padding:8px;color:#666;font-size:11px">Cargando…</div>';
     try {
-        const r = await fetch(`/api/files/tree?session_id=${currentSession}&path=.`);
-        if (!r.ok) throw new Error(await r.text());
+        const r = await fetch(`/api/files/tree?session_id=${currentSession.session_id}&path=.`);
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            throw new Error(err.detail || `Error ${r.status}`);
+        }
         const data = await r.json();
         container.innerHTML = '';
         if (!data.entries.length) {
@@ -81,22 +118,8 @@ async function refreshTree() {
             container.appendChild(makeTreeItem(entry, 0));
         }
     } catch (e) {
-        container.innerHTML = `<div style="padding:8px;color:#f48771;font-size:11px">Error: ${e.message}</div>`;
+        container.innerHTML = `<div style="padding:8px;color:#f48771;font-size:11px">Error: ${escapeHtml(e.message)}</div>`;
     }
-}
-
-function applyPanelState(state) {
-    // Solo cambiamos el grid-template-columns; no usamos clases que hagan display:none
-    updateGridTemplate(state);
-
-    // Mostrar/ocultar botones de "mostrar panel"
-    const btnShowExplorer = document.getElementById('btn-show-explorer');
-    const btnShowChat = document.getElementById('btn-show-chat');
-    if (btnShowExplorer) btnShowExplorer.style.display = state.collapseExplorer ? 'inline-block' : 'none';
-    if (btnShowChat) btnShowChat.style.display = state.collapseChat ? 'inline-block' : 'none';
-
-    // Ajustar el editor si cambia el tamaño
-    if (editor) setTimeout(() => editor.layout(), 200);
 }
 
 function makeTreeItem(entry, depth) {
@@ -117,7 +140,7 @@ function makeTreeItem(entry, depth) {
             item.classList.toggle('active', children.classList.contains('open'));
             if (children.classList.contains('open') && !children.dataset.loaded) {
                 try {
-                    const r = await fetch(`/api/files/tree?session_id=${currentSession}&path=${encodeURIComponent(entry.path)}`);
+                    const r = await fetch(`/api/files/tree?session_id=${currentSession.session_id}&path=${encodeURIComponent(entry.path)}`);
                     const data = await r.json();
                     for (const child of data.entries) {
                         children.appendChild(makeTreeItem(child, depth + 1));
@@ -147,10 +170,11 @@ function highlightTreeItem(path) {
 //  Abrir / cerrar / guardar archivos
 // ══════════════════════════════════════════════════════════════
 async function openFile(path) {
+    if (!currentSession) return;
     let tab = openTabs.find(t => t.path === path);
     if (!tab) {
         try {
-            const r = await fetch(`/api/files/read?session_id=${currentSession}&path=${encodeURIComponent(path)}`);
+            const r = await fetch(`/api/files/read?session_id=${currentSession.session_id}&path=${encodeURIComponent(path)}`);
             if (!r.ok) throw new Error(await r.text());
             const data = await r.json();
             tab = { path, content: data.content, savedContent: data.content, dirty: false };
@@ -175,12 +199,13 @@ function showTabInEditor(tab) {
 
 function renderTabs() {
     const container = document.getElementById('tabs');
+    if (!container) return;
     container.innerHTML = '';
     for (const tab of openTabs) {
         const div = document.createElement('div');
         div.className = 'tab' + (tab.path === activeTabPath ? ' active' : '');
         const name = tab.path.split('/').pop();
-        div.innerHTML = `<span>${escapeHtml(name)}</span>${tab.dirty ? '<span class="dirty">●</span>' : ''}<span class="close" onclick="event.stopPropagation(); closeTab('${tab.path}')">×</span>`;
+        div.innerHTML = `<span>${escapeHtml(name)}</span>${tab.dirty ? '<span class="dirty">●</span>' : ''}<span class="close" onclick="event.stopPropagation(); closeTab('${escapeHtml(tab.path)}')">×</span>`;
         div.title = tab.path;
         div.onclick = () => {
             activeTabPath = tab.path;
@@ -210,7 +235,7 @@ function closeTab(path) {
 }
 
 async function saveCurrentFile() {
-    if (!activeTabPath) return;
+    if (!activeTabPath || !currentSession) return;
     const tab = openTabs.find(t => t.path === activeTabPath);
     if (!tab) return;
     const content = editor.getValue();
@@ -218,7 +243,11 @@ async function saveCurrentFile() {
         const r = await fetch('/api/files/write', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: currentSession, path: tab.path, content }),
+            body: JSON.stringify({
+                session_id: currentSession.session_id,
+                path: tab.path,
+                content,
+            }),
         });
         if (!r.ok) throw new Error(await r.text());
         tab.savedContent = content;
@@ -235,83 +264,550 @@ function updateStatusBar() {
     const tab = openTabs.find(t => t.path === activeTabPath);
     const dirty = tab && tab.dirty;
 
-    document.getElementById('status-file').textContent = tab ? tab.path : 'Sin archivo abierto';
-    document.getElementById('status-dirty').style.display = dirty ? 'inline-block' : 'none';
-    document.getElementById('status-lang').textContent = tab ? detectLang(tab.path) : '';
+    const statusFile = document.getElementById('status-file');
+    if (statusFile) statusFile.textContent = tab ? tab.path : 'Sin archivo abierto';
 
-    // Mostrar/ocultar el botón de guardar
+    const statusDirty = document.getElementById('status-dirty');
+    if (statusDirty) statusDirty.style.display = dirty ? 'inline-block' : 'none';
+
+    const statusLang = document.getElementById('status-lang');
+    if (statusLang) statusLang.textContent = tab ? detectLang(tab.path) : '';
+
     const btnSave = document.getElementById('btn-save');
-    if (btnSave) {
-        btnSave.style.display = dirty ? 'inline-block' : 'none';
-    }
+    if (btnSave) btnSave.style.display = dirty ? 'inline-block' : 'none';
 }
 
 // ══════════════════════════════════════════════════════════════
-//  Sesiones
+//  Paneles redimensionables y colapsables
 // ══════════════════════════════════════════════════════════════
-function onSessionSelect(id) {
-    if (!id) return;
-    openSession(id);
-}
+const PANEL_STATE_KEY = 'agent-dashboard-panel-state-v2';
 
-async function newSession() {
-    const id = 'sess-' + Date.now();
-    const defaultName = 'Sesión ' + new Date().toLocaleTimeString('es-ES', {hour: '2-digit', minute:'2-digit'});
-    const name = prompt('Nombre de la nueva sesión:', defaultName);
-    if (name === null) return;  // Cancelado
-
-    currentSession = id;
-    openTabs = [];
-    activeTabPath = null;
-    if (editor) editor.setModel(monaco.editor.createModel('', 'plaintext'));
-    renderTabs();
-    document.getElementById('messages').innerHTML = '';
-    document.getElementById('session-title').textContent = id;
-    document.getElementById('session-workspace').textContent = '';
-    loadSessions();
-    refreshTree();
-    document.getElementById('input').focus();
-    // Guardar el nombre
+function loadPanelState() {
     try {
-        await fetch(`/api/sessions/${currentSession}/rename`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: name.trim() || defaultName }),
-        });
+        const raw = localStorage.getItem(PANEL_STATE_KEY);
+        if (raw) return JSON.parse(raw);
+    } catch (e) {}
+    return { explorerWidth: 260, chatWidth: 400, collapseExplorer: false, collapseChat: false };
+}
+
+function savePanelState(state) {
+    try {
+        localStorage.setItem(PANEL_STATE_KEY, JSON.stringify(state));
     } catch (e) {}
 }
 
-async function openSession(id) {
-    currentSession = id;
-    openTabs = [];
-    activeTabPath = null;
-    if (editor) editor.setModel(monaco.editor.createModel('', 'plaintext'));
-    renderTabs();
+function applyPanelState(state) {
+    updateGridTemplate(state);
 
-    const r = await fetch(`/api/sessions/${id}`);
-    const data = await r.json();
-    const container = document.getElementById('messages');
-    container.innerHTML = '';
-    for (const m of data.messages) {
-        if (m.role === 'tool') continue;
-        addMessage(m.role, m.content);
-    }
-    document.getElementById('session-title').textContent = data.meta.name || id;
-	document.getElementById('session-workspace').textContent = '📁 ' + (data.meta.workspace || '—');
-    loadSessions();
-    refreshTree();
+    const btnShowExplorer = document.getElementById('btn-show-explorer');
+    const btnShowChat = document.getElementById('btn-show-chat');
+    if (btnShowExplorer) btnShowExplorer.style.display = state.collapseExplorer ? 'inline-block' : 'none';
+    if (btnShowChat) btnShowChat.style.display = state.collapseChat ? 'inline-block' : 'none';
+
+    if (editor) setTimeout(() => editor.layout(), 200);
 }
 
-async function deleteSession(id) {
-    if (!confirm('¿Borrar esta sesión?')) return;
-    await fetch(`/api/sessions/${id}`, { method: 'DELETE' });
-    if (currentSession === id) {
-        currentSession = null;
-        document.getElementById('messages').innerHTML = '';
-        document.getElementById('session-title').textContent = '—';
-        document.getElementById('session-workspace').textContent = '';
+function updateGridTemplate(state) {
+    const app = document.getElementById('app');
+    if (!app) return;
+    const eW = state.collapseExplorer ? 0 : state.explorerWidth;
+    const cW = state.collapseChat ? 0 : state.chatWidth;
+    const eR = state.collapseExplorer ? 0 : 4;
+    const cR = state.collapseChat ? 0 : 4;
+    app.style.gridTemplateColumns = `${eW}px ${eR}px 1fr ${cR}px ${cW}px`;
+}
+
+function togglePanel(which) {
+    const state = loadPanelState();
+    if (which === 'explorer') state.collapseExplorer = !state.collapseExplorer;
+    if (which === 'chat') state.collapseChat = !state.collapseChat;
+    savePanelState(state);
+    applyPanelState(state);
+}
+
+function initResizers() {
+    const state = loadPanelState();
+    applyPanelState(state);
+
+    const resizerLeft = document.getElementById('resizer-left');
+    if (resizerLeft) {
+        resizerLeft.addEventListener('mousedown', (e) => startDrag(e, 'left'));
     }
-    loadSessions();
+
+    const resizerRight = document.getElementById('resizer-right');
+    if (resizerRight) {
+        resizerRight.addEventListener('mousedown', (e) => startDrag(e, 'right'));
+    }
+}
+
+function startDrag(e, side) {
+    e.preventDefault();
+    const resizer = e.currentTarget;
+    resizer.classList.add('dragging');
+    const startX = e.clientX;
+    const state = loadPanelState();
+    const startWidth = side === 'left' ? state.explorerWidth : state.chatWidth;
+
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+
+    function onMove(ev) {
+        const delta = side === 'left' ? ev.clientX - startX : startX - ev.clientX;
+        const newWidth = Math.max(150, Math.min(600, startWidth + delta));
+        if (side === 'left') state.explorerWidth = newWidth;
+        else state.chatWidth = newWidth;
+        updateGridTemplate(state);
+        if (editor) editor.layout();
+    }
+
+    function onUp() {
+        resizer.classList.remove('dragging');
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+        savePanelState(state);
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+    }
+
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Proyectos y sesiones
+// ══════════════════════════════════════════════════════════════
+async function loadProjects() {
+    const r = await fetch('/api/projects');
+    allProjects = await r.json();
+    renderProjects();
+}
+
+async function loadSessions() {
+    const r = await fetch('/api/sessions');
+    allSessions = await r.json();
+    renderSessions();
+}
+
+function renderProjects() {
+    const container = document.getElementById('projects-list');
+    if (!container) return;
+    container.innerHTML = '';
+
+    if (!allProjects.length) {
+        container.innerHTML = '<div style="padding:8px;color:#666;font-size:11px">No hay proyectos</div>';
+        return;
+    }
+
+    for (const p of allProjects) {
+        const item = document.createElement('div');
+        item.className = 'project-item';
+        item.dataset.projectId = p.id;
+        const isActive = currentProject && currentProject.id === p.id;
+
+        item.innerHTML = `
+            <div class="project-row">
+                <span class="project-color" style="background: ${escapeHtml(p.color || '#4ec9b0')}"></span>
+                <span class="project-name">${escapeHtml(p.name)}</span>
+                <span class="project-actions">
+                    <button class="proj-btn" onclick="event.stopPropagation(); editProject(${p.id})" title="Editar">✏️</button>
+                    <button class="proj-btn" onclick="event.stopPropagation(); deleteProject(${p.id})" title="Borrar">×</button>
+                </span>
+            </div>
+        `;
+
+        if (isActive) item.classList.add('active');
+
+        item.onclick = () => selectProject(p.id);
+
+        // Sesiones del proyecto (si está activo)
+        if (isActive) {
+            const sessions = allSessions.filter(s => s.project_id === p.id);
+            const sessionsContainer = document.createElement('div');
+            sessionsContainer.className = 'project-sessions';
+            for (const s of sessions) {
+                sessionsContainer.appendChild(makeSessionItem(s));
+            }
+            item.appendChild(sessionsContainer);
+        }
+
+        container.appendChild(item);
+    }
+
+    // Sesiones sin proyecto (chat libre)
+    const orphanSessions = allSessions.filter(s => !s.project_id);
+    if (orphanSessions.length) {
+        const container2 = document.createElement('div');
+        container2.className = 'project-item orphan';
+        container2.innerHTML = `
+            <div class="project-row">
+                <span class="project-color" style="background: #666"></span>
+                <span class="project-name" style="color:#888">Chat libre</span>
+            </div>
+        `;
+        const sessionsContainer = document.createElement('div');
+        sessionsContainer.className = 'project-sessions';
+        for (const s of orphanSessions) {
+            sessionsContainer.appendChild(makeSessionItem(s));
+        }
+        container2.appendChild(sessionsContainer);
+        container.appendChild(container2);
+    }
+}
+
+function makeSessionItem(s) {
+    const div = document.createElement('div');
+    div.className = 'session-item' + (currentSession && currentSession.session_id === s.session_id ? ' active' : '');
+    div.dataset.sessionId = s.session_id;
+
+    const label = s.name || (s.preview ? s.preview.slice(0, 40) : s.session_id);
+    const msgs = s.message_count ? ` · ${s.message_count}` : '';
+
+    div.innerHTML = `
+        <span class="session-icon">💬</span>
+        <span class="session-name">${escapeHtml(label)}</span>
+        <span class="session-meta">${msgs}</span>
+        <span class="session-actions">
+            <button class="proj-btn" onclick="event.stopPropagation(); renameSession('${escapeHtml(s.session_id)}')" title="Renombrar">✏️</button>
+            <button class="proj-btn" onclick="event.stopPropagation(); deleteSession('${escapeHtml(s.session_id)}')" title="Borrar">×</button>
+        </span>
+    `;
+
+    div.onclick = () => openSession(s.session_id);
+    return div;
+}
+
+function renderSessions() {
+    // Las sesiones se renderizan dentro de los proyectos.
+    // Esta función se llama tras cargar sesiones para que los proyectos se actualicen.
+    renderProjects();
+}
+
+async function selectProject(projectId) {
+    const p = allProjects.find(x => x.id === projectId);
+    if (!p) return;
+    currentProject = p;
+    renderProjects();
+}
+
+async function editProject(projectId) {
+    const p = allProjects.find(x => x.id === projectId);
+    if (!p) return;
+
+    const name = prompt('Nombre del proyecto:', p.name);
+    if (name === null) return;
+    const color = prompt('Color (hex, ej. #4ec9b0):', p.color || '#4ec9b0');
+    if (color === null) return;
+
+    try {
+        const r = await fetch(`/api/projects/${projectId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: name.trim(), color: color.trim() }),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        await loadProjects();
+    } catch (e) {
+        alert('Error editando proyecto: ' + e.message);
+    }
+}
+
+async function deleteProject(projectId) {
+    if (!confirm('¿Borrar este proyecto? Las sesiones quedarán como chat libre.')) return;
+    try {
+        await fetch(`/api/projects/${projectId}`, { method: 'DELETE' });
+        if (currentProject && currentProject.id === projectId) {
+            currentProject = null;
+        }
+        await loadProjects();
+        await loadSessions();
+    } catch (e) {
+        alert('Error borrando proyecto: ' + e.message);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Abrir / crear / editar sesiones
+// ══════════════════════════════════════════════════════════════
+async function openSession(sessionId) {
+    try {
+        const r = await fetch(`/api/sessions/${sessionId}`);
+        if (!r.ok) throw new Error(await r.text());
+        const data = await r.json();
+
+        currentSession = data.session;
+        currentProject = currentSession.project_id
+            ? allProjects.find(p => p.id === currentSession.project_id) || null
+            : null;
+
+        // Reset editor
+        openTabs = [];
+        activeTabPath = null;
+        if (editor) editor.setModel(monaco.editor.createModel('', 'plaintext'));
+        renderTabs();
+
+        // Render mensajes
+        const container = document.getElementById('messages');
+        container.innerHTML = '';
+        for (const m of data.messages) {
+            if (m.role === 'tool') continue;
+            addMessage(m.role, m.content);
+        }
+
+        updateSessionHeader();
+        renderProjects();
+        refreshTree();
+        updateChatEnabled(true);
+
+        document.getElementById('input').focus();
+    } catch (e) {
+        alert('Error abriendo sesión: ' + e.message);
+    }
+}
+
+function updateSessionHeader() {
+    const title = document.getElementById('session-title');
+    if (title) {
+        title.textContent = currentSession
+            ? (currentSession.name || currentSession.session_id)
+            : '—';
+    }
+    const ws = document.getElementById('session-workspace');
+    if (ws) {
+        if (!currentSession) {
+            ws.textContent = '';
+        } else if (currentProject) {
+            ws.textContent = '📁 ' + currentProject.name + ' · ' + currentProject.path;
+        } else {
+            ws.textContent = '💬 Chat libre (sin proyecto)';
+        }
+    }
+}
+
+function updateChatEnabled(enabled) {
+    const input = document.getElementById('input');
+    const send = document.getElementById('send');
+    if (input) input.disabled = !enabled;
+    if (send) send.disabled = !enabled;
+}
+
+async function newSessionDialog() {
+    // Reset
+    document.getElementById('new-sess-name').value = '';
+    document.getElementById('new-sess-project').value = currentProject ? currentProject.id : '';
+
+    // Poblar select de proyectos
+    const sel = document.getElementById('new-sess-project');
+    sel.innerHTML = '<option value="">— Chat libre (sin proyecto) —</option>';
+    for (const p of allProjects) {
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = p.name + ' · ' + p.path;
+        sel.appendChild(opt);
+    }
+
+    // Mostrar ruta actual del proyecto seleccionado
+    updateNewSessProjectPath();
+
+    document.getElementById('new-session-modal').classList.add('open');
+    document.getElementById('new-sess-name').focus();
+}
+
+function updateNewSessProjectPath() {
+    const sel = document.getElementById('new-sess-project');
+    const projectId = sel.value ? parseInt(sel.value) : null;
+    const pathInput = document.getElementById('new-sess-path');
+    if (!pathInput) return;
+
+    if (projectId) {
+        const p = allProjects.find(x => x.id === projectId);
+        pathInput.value = p ? p.path : '';
+        pathInput.disabled = true;
+    } else {
+        pathInput.value = '';
+        pathInput.disabled = false;
+        pathInput.placeholder = 'Ruta del proyecto (opcional, para chat libre)';
+    }
+}
+
+async function createSessionFromDialog() {
+    const name = document.getElementById('new-sess-name').value.trim();
+    const projectIdRaw = document.getElementById('new-sess-project').value;
+    const projectPath = document.getElementById('new-sess-path').value.trim();
+
+    if (!name) {
+        alert('Pon un nombre a la sesión.');
+        return;
+    }
+
+    const payload = { name };
+    if (projectIdRaw) {
+        payload.project_id = parseInt(projectIdRaw);
+    } else if (projectPath) {
+        payload.project_path = projectPath;
+    }
+
+    try {
+        const r = await fetch('/api/sessions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            throw new Error(err.detail || `Error ${r.status}`);
+        }
+        const newSession = await r.json();
+        closeNewSessionDialog();
+
+        await loadProjects();
+        await loadSessions();
+        await openSession(newSession.session_id);
+    } catch (e) {
+        alert('Error creando sesión: ' + e.message);
+    }
+}
+
+function closeNewSessionDialog() {
+    document.getElementById('new-session-modal').classList.remove('open');
+}
+
+async function renameSession(sessionId) {
+    let currentName = '';
+    try {
+        const r = await fetch(`/api/sessions/${sessionId}`);
+        const data = await r.json();
+        currentName = data.session.name || '';
+    } catch (e) {}
+
+    const newName = prompt('Nuevo nombre de la sesión:', currentName || sessionId);
+    if (newName === null) return;
+    if (!newName.trim()) {
+        alert('El nombre no puede estar vacío.');
+        return;
+    }
+
+    try {
+        const r = await fetch(`/api/sessions/${sessionId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: newName.trim() }),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        await loadSessions();
+        if (currentSession && currentSession.session_id === sessionId) {
+            currentSession.name = newName.trim();
+            updateSessionHeader();
+        }
+    } catch (e) {
+        alert('Error renombrando: ' + e.message);
+    }
+}
+
+async function deleteSession(sessionId) {
+    if (!confirm('¿Borrar esta sesión?')) return;
+    try {
+        await fetch(`/api/sessions/${sessionId}`, { method: 'DELETE' });
+        if (currentSession && currentSession.session_id === sessionId) {
+            currentSession = null;
+            currentProject = null;
+            document.getElementById('messages').innerHTML = '';
+            updateSessionHeader();
+            updateChatEnabled(false);
+            refreshTree();
+        }
+        await loadSessions();
+    } catch (e) {
+        alert('Error borrando: ' + e.message);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Modal de configuración de sesión (workspace + prompt)
+// ══════════════════════════════════════════════════════════════
+async function openSessionConfig() {
+    if (!currentSession) {
+        alert('Abre o crea una sesión primero.');
+        return;
+    }
+
+    // System prompt
+    document.getElementById('sess-prompt').value = currentSession.system_prompt || '';
+
+    // Proyecto actual
+    const sel = document.getElementById('sess-project');
+    sel.innerHTML = '<option value="">— Chat libre (sin proyecto) —</option>';
+    for (const p of allProjects) {
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = p.name + ' · ' + p.path;
+        sel.appendChild(opt);
+    }
+    sel.value = currentSession.project_id || '';
+
+    document.getElementById('sess-project-path').value = currentProject ? currentProject.path : '';
+    document.getElementById('sess-project-path').disabled = !!currentSession.project_id;
+
+    document.getElementById('session-modal').classList.add('open');
+}
+
+function closeSessionConfig() {
+    document.getElementById('session-modal').classList.remove('open');
+}
+
+function onSessProjectChange() {
+    const sel = document.getElementById('sess-project');
+    const pathInput = document.getElementById('sess-project-path');
+    if (!sel.value) {
+        pathInput.value = '';
+        pathInput.disabled = false;
+    } else {
+        const p = allProjects.find(x => x.id === parseInt(sel.value));
+        pathInput.value = p ? p.path : '';
+        pathInput.disabled = true;
+    }
+}
+
+async function saveSessionConfig() {
+    if (!currentSession) return;
+
+    const payload = {
+        system_prompt: document.getElementById('sess-prompt').value,
+    };
+
+    const sel = document.getElementById('sess-project');
+    const newPath = document.getElementById('sess-project-path').value.trim();
+
+    if (sel.value) {
+        payload.project_id = parseInt(sel.value);
+    } else if (newPath) {
+        payload.project_path = newPath;
+    } else {
+        payload.clear_project = true;
+    }
+
+    try {
+        const r = await fetch(`/api/sessions/${currentSession.session_id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            throw new Error(err.detail || `Error ${r.status}`);
+        }
+        const updated = await r.json();
+        currentSession = updated;
+        currentProject = updated.project_id
+            ? allProjects.find(p => p.id === updated.project_id) || null
+            : null;
+        closeSessionConfig();
+        updateSessionHeader();
+        await loadProjects();
+        await loadSessions();
+        refreshTree();
+    } catch (e) {
+        alert('Error guardando: ' + e.message);
+    }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -343,23 +839,16 @@ function updateToolBadge(div, result) {
     div.innerHTML += ` <span class="tool-result">${escapeHtml(summary.slice(0, 120))}</span>`;
 }
 
-function scrollDown() {
-    const m = document.getElementById('messages');
-    m.scrollTop = m.scrollHeight;
-}
-
-function escapeHtml(s) {
-    const d = document.createElement('div');
-    d.textContent = s == null ? '' : String(s);
-    return d.innerHTML;
-}
-
 async function send() {
     if (isStreaming) return;
+    if (!currentSession) {
+        alert('Crea o abre una sesión primero.');
+        return;
+    }
+
     const input = document.getElementById('input');
     const text = input.value.trim();
     if (!text) return;
-    if (!currentSession) newSession();
 
     input.value = '';
     addMessage('user', text);
@@ -373,8 +862,16 @@ async function send() {
         const response = await fetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: currentSession, message: text }),
+            body: JSON.stringify({
+                session_id: currentSession.session_id,
+                message: text,
+            }),
         });
+        if (!response.ok) {
+            const err = await response.text();
+            throw new Error(err);
+        }
+
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
@@ -415,13 +912,93 @@ async function send() {
         }
     } catch (e) {
         assistantDiv.className = 'msg error';
-        assistantDiv.textContent = 'Error de conexión: ' + e.message;
+        assistantDiv.textContent = 'Error: ' + e.message;
     } finally {
         isStreaming = false;
         document.getElementById('send').disabled = false;
         loadSessions();
-        refreshTree();
     }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Explorador de carpetas del sistema
+// ══════════════════════════════════════════════════════════════
+let fsCurrentPath = null;
+let fsCurrentParent = null;
+let fsTargetInput = null;
+
+function openFsBrowser(targetInputId) {
+    fsTargetInput = targetInputId;
+    const input = document.getElementById(targetInputId);
+    const initial = input ? input.value.trim() : null;
+    document.getElementById('fs-modal').classList.add('open');
+    fsNavigate(initial || null);
+}
+
+function closeFsBrowser() {
+    document.getElementById('fs-modal').classList.remove('open');
+}
+
+async function fsNavigate(path) {
+    const list = document.getElementById('fs-list');
+    list.innerHTML = '<div style="padding:8px;color:#666;font-size:12px">Cargando…</div>';
+
+    try {
+        const url = path
+            ? `/api/fs/browse?path=${encodeURIComponent(path)}`
+            : `/api/fs/browse`;
+        const r = await fetch(url);
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            throw new Error(err.detail || `Error ${r.status}`);
+        }
+        const data = await r.json();
+
+        fsCurrentPath = data.path;
+        fsCurrentParent = data.parent;
+        document.getElementById('fs-path').value = data.path;
+
+        list.innerHTML = '';
+        if (!data.entries.length) {
+            list.innerHTML = '<div style="padding:8px;color:#666;font-size:12px">(Carpeta vacía)</div>';
+            return;
+        }
+        for (const entry of data.entries) {
+            const item = document.createElement('div');
+            item.style.cssText = 'padding:6px 10px;cursor:pointer;font-size:13px;display:flex;align-items:center;gap:8px;border-radius:3px';
+            item.innerHTML = `<span>📁</span><span>${escapeHtml(entry.name)}</span>`;
+            item.onmouseenter = () => item.style.background = '#2a2d2e';
+            item.onmouseleave = () => item.style.background = '';
+            item.ondblclick = () => fsNavigate(entry.path);
+            item.onclick = () => {
+                list.querySelectorAll('div').forEach(el => el.style.background = '');
+                item.style.background = '#094771';
+            };
+            list.appendChild(item);
+        }
+    } catch (e) {
+        list.innerHTML = `<div style="padding:8px;color:#f48771;font-size:12px">Error: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+async function fsGoHome() {
+    fsCurrentPath = null;
+    await fsNavigate(null);
+}
+
+async function fsGoUp() {
+    if (fsCurrentParent) await fsNavigate(fsCurrentParent);
+}
+
+async function fsRefresh() {
+    if (fsCurrentPath) await fsNavigate(fsCurrentPath);
+}
+
+function fsSelectCurrent() {
+    if (!fsCurrentPath || !fsTargetInput) return;
+    const input = document.getElementById(fsTargetInput);
+    if (input) input.value = fsCurrentPath;
+    closeFsBrowser();
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -447,7 +1024,7 @@ async function checkStatus() {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  Modales
+//  Modal LLM config
 // ══════════════════════════════════════════════════════════════
 async function openLLMConfig() {
     const cfg = await (await fetch('/api/config')).json();
@@ -481,59 +1058,22 @@ async function saveLLMConfig() {
     checkStatus();
 }
 
-async function openSessionConfig() {
-    if (!currentSession) {
-        alert('Crea o abre una sesión primero.');
-        return;
-    }
-    const r = await fetch(`/api/sessions/${currentSession}`);
-    const data = await r.json();
-    document.getElementById('sess-workspace').value = data.meta.workspace || '';
-    document.getElementById('sess-prompt').value = data.meta.system_prompt || '';
-    document.getElementById('session-modal').classList.add('open');
-}
-
-function closeSessionConfig() {
-    document.getElementById('session-modal').classList.remove('open');
-}
-
-async function saveSessionConfig() {
-    if (!currentSession) return;
-    const payload = {
-        workspace: document.getElementById('sess-workspace').value.trim(),
-        system_prompt: document.getElementById('sess-prompt').value,
-    };
-    try {
-        const r = await fetch(`/api/sessions/${currentSession}/meta`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-        });
-        if (!r.ok) {
-            const err = await r.json();
-            alert('Error: ' + (err.detail || 'desconocido'));
-            return;
-        }
-        const data = await r.json();
-        document.getElementById('session-workspace').textContent = '📁 ' + data.workspace;
-        closeSessionConfig();
-        refreshTree();
-    } catch (e) {
-        alert('Error: ' + e.message);
-    }
-}
-
 // ══════════════════════════════════════════════════════════════
 //  Inicialización
 // ══════════════════════════════════════════════════════════════
 async function init() {
-    document.getElementById('input').addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            send();
-        }
-    });
+    const input = document.getElementById('input');
+    if (input) {
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                send();
+            }
+        });
+    }
+
     setInterval(checkStatus, 15000);
+
     window.addEventListener('beforeunload', (e) => {
         const hasDirty = openTabs.some(t => t.dirty);
         if (hasDirty) {
@@ -543,235 +1083,15 @@ async function init() {
         }
     });
 
-    // ← AÑADE ESTA LÍNEA
     initResizers();
 
     await checkStatus();
+    await loadProjects();
     await loadSessions();
-    document.getElementById('input').focus();
-}
 
-async function renameCurrentSession() {
-    if (!currentSession) {
-        alert('No hay sesión activa.');
-        return;
-    }
-    // Obtener el nombre actual para ponerlo por defecto
-    let currentName = '';
-    try {
-        const r = await fetch(`/api/sessions/${currentSession}`);
-        const data = await r.json();
-        currentName = data.meta.name || '';
-    } catch (e) {}
+    updateChatEnabled(false);
+    refreshTree();
 
-    const newName = prompt('Nuevo nombre de la sesión:', currentName || currentSession);
-    if (newName === null) return;  // Cancelado
-    const trimmed = newName.trim();
-    if (!trimmed) {
-        alert('El nombre no puede estar vacío.');
-        return;
-    }
-
-    try {
-        const r = await fetch(`/api/sessions/${currentSession}/rename`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: trimmed }),
-        });
-        if (!r.ok) throw new Error(await r.text());
-        document.getElementById('session-title').textContent = trimmed;
-        loadSessions();
-    } catch (e) {
-        alert('Error renombrando: ' + e.message);
-    }
-}
-
-// ══════════════════════════════════════════════════════════════
-//  Paneles redimensionables y colapsables
-// ══════════════════════════════════════════════════════════════
-const PANEL_STATE_KEY = 'agent-dashboard-panel-state-v1';
-
-function loadPanelState() {
-    try {
-        const raw = localStorage.getItem(PANEL_STATE_KEY);
-        if (raw) return JSON.parse(raw);
-    } catch (e) {}
-    return { explorerWidth: 240, chatWidth: 380, collapseExplorer: false, collapseChat: false };
-}
-
-function savePanelState(state) {
-    try {
-        localStorage.setItem(PANEL_STATE_KEY, JSON.stringify(state));
-    } catch (e) {}
-}
-
-function updateGridTemplate(state) {
-    const app = document.getElementById('app');
-    if (!app) return;
-    const eW = state.collapseExplorer ? 0 : state.explorerWidth;
-    const cW = state.collapseChat ? 0 : state.chatWidth;
-    const eR = state.collapseExplorer ? 0 : 4;
-    const cR = state.collapseChat ? 0 : 4;
-    app.style.gridTemplateColumns = `${eW}px ${eR}px 1fr ${cR}px ${cW}px`;
-}
-
-function togglePanel(which) {
-    const state = loadPanelState();
-    if (which === 'explorer') state.collapseExplorer = !state.collapseExplorer;
-    if (which === 'chat') state.collapseChat = !state.collapseChat;
-    savePanelState(state);
-    applyPanelState(state);
-}
-
-function initResizers() {
-    const state = loadPanelState();
-    applyPanelState(state);
-
-    // Resizer izquierdo (sidebar <-> editor)
-    const resizerLeft = document.getElementById('resizer-left');
-    if (resizerLeft) {
-        resizerLeft.addEventListener('mousedown', (e) => startDrag(e, 'left'));
-    }
-
-    // Resizer derecho (editor <-> chat)
-    const resizerRight = document.getElementById('resizer-right');
-    if (resizerRight) {
-        resizerRight.addEventListener('mousedown', (e) => startDrag(e, 'right'));
-    }
-}
-
-async function loadSessions() {
-    const r = await fetch('/api/sessions');
-    const sessions = await r.json();
-    const select = document.getElementById('session-select');
-    select.innerHTML = '<option value="">— Elegir —</option>';
-    for (const s of sessions) {
-        const opt = document.createElement('option');
-        opt.value = s.session_id;
-        // Si hay nombre, mostrarlo. Si no, mostrar el preview del primer mensaje (o el ID)
-        const label = s.name
-            ? s.name
-            : (s.preview ? s.preview.slice(0, 50) : s.session_id);
-        opt.textContent = label;
-        if (s.session_id === currentSession) opt.selected = true;
-        select.appendChild(opt);
-    }
-}
-
-function startDrag(e, side) {
-    e.preventDefault();
-    const resizer = e.currentTarget;
-    resizer.classList.add('dragging');
-    const startX = e.clientX;
-    const state = loadPanelState();
-    const startWidth = side === 'left' ? state.explorerWidth : state.chatWidth;
-
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-
-    function onMove(ev) {
-        const delta = side === 'left' ? ev.clientX - startX : startX - ev.clientX;
-        const newWidth = Math.max(150, Math.min(600, startWidth + delta));
-        if (side === 'left') state.explorerWidth = newWidth;
-        else state.chatWidth = newWidth;
-        updateGridTemplate(state);
-        if (editor) editor.layout();
-    }
-
-    function onUp() {
-        resizer.classList.remove('dragging');
-        document.body.style.cursor = '';
-        document.body.style.userSelect = '';
-        savePanelState(state);
-        document.removeEventListener('mousemove', onMove);
-        document.removeEventListener('mouseup', onUp);
-    }
-
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
-}
-
-
-// ══════════════════════════════════════════════════════════════
-//  Explorador de carpetas del sistema
-// ══════════════════════════════════════════════════════════════
-let fsCurrentPath = null;
-let fsCurrentParent = null;
-
-async function openFsBrowser(startPath = null) {
-    const input = document.getElementById('sess-workspace');
-    const initial = startPath || input.value.trim() || null;
-    document.getElementById('fs-modal').classList.add('open');
-    await fsNavigate(initial);
-}
-
-function closeFsBrowser() {
-    document.getElementById('fs-modal').classList.remove('open');
-}
-
-async function fsNavigate(path) {
-    const list = document.getElementById('fs-list');
-    list.innerHTML = '<div style="padding:8px;color:#666;font-size:12px">Cargando…</div>';
-
-    try {
-        const url = path
-            ? `/api/fs/browse?path=${encodeURIComponent(path)}`
-            : `/api/fs/browse`;
-        const r = await fetch(url);
-        if (!r.ok) {
-            const err = await r.json().catch(() => ({}));
-            throw new Error(err.detail || `Error ${r.status}`);
-        }
-        const data = await r.json();
-
-        fsCurrentPath = data.path;
-        fsCurrentParent = data.parent;
-
-        document.getElementById('fs-path').value = data.path;
-
-        list.innerHTML = '';
-
-        if (data.entries.length === 0) {
-            list.innerHTML = '<div style="padding:8px;color:#666;font-size:12px">(Carpeta vacía)</div>';
-        } else {
-            for (const entry of data.entries) {
-                const item = document.createElement('div');
-                item.style.cssText = 'padding:6px 10px;cursor:pointer;font-size:13px;display:flex;align-items:center;gap:8px;border-radius:3px';
-                item.innerHTML = `<span>📁</span><span>${escapeHtml(entry.name)}</span>`;
-                item.onmouseenter = () => item.style.background = '#2a2d2e';
-                item.onmouseleave = () => item.style.background = '';
-                item.ondblclick = () => fsNavigate(entry.path);
-                item.onclick = () => {
-                    list.querySelectorAll('div').forEach(el => el.style.background = '');
-                    item.style.background = '#094771';
-                };
-                list.appendChild(item);
-            }
-        }
-    } catch (e) {
-        list.innerHTML = `<div style="padding:8px;color:#f48771;font-size:12px">Error: ${escapeHtml(e.message)}</div>`;
-    }
-}
-
-async function fsGoHome() {
-    fsCurrentPath = null;
-    await fsNavigate(null);
-}
-
-async function fsGoUp() {
-    if (fsCurrentParent) {
-        await fsNavigate(fsCurrentParent);
-    }
-}
-
-async function fsRefresh() {
-    if (fsCurrentPath) {
-        await fsNavigate(fsCurrentPath);
-    }
-}
-
-function fsSelectCurrent() {
-    if (!fsCurrentPath) return;
-    document.getElementById('sess-workspace').value = fsCurrentPath;
-    closeFsBrowser();
+    const input2 = document.getElementById('input');
+    if (input2) input2.focus();
 }
