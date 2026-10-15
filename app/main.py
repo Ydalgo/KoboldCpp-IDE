@@ -176,9 +176,22 @@ async def update_project(project_id: int, payload: ProjectUpdate):
     return p
 
 
-@app.delete("/api/projects/{project_id}")
-async def delete_project(project_id: int):
-    await db.delete_project(project_id)
+@app.delete("/api/sessions/{session_id}")
+async def delete_session(session_id: str):
+    await db.delete_session(session_id)
+    return {"ok": True}
+
+class SessionMetaSave(BaseModel):
+    stats: dict
+
+
+@app.post("/api/sessions/{session_id}/meta")
+async def save_session_meta(session_id: str, payload: SessionMetaSave):
+    """Guarda las métricas de una respuesta del asistente."""
+    s = await db.get_session(session_id)
+    if not s:
+        raise HTTPException(404, "Sesión no encontrada")
+    await db.save_message(session_id, "meta", json.dumps(payload.stats))
     return {"ok": True}
 
 
@@ -275,6 +288,7 @@ async def delete_session(session_id: str):
     await db.delete_session(session_id)
     return {"ok": True}
 
+    
 
 # ── Gestor de archivos ───────────────────────────────────────
 IGNORE_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules",
@@ -476,10 +490,20 @@ async def chat(req: ChatRequest):
                         "tool_call_id": tc.get("id", name),
                         "content": json.dumps(result)[:4000],
                     })
-
             final = "".join(full_text)
             if final:
                 await db.save_message(req.session_id, "assistant", final)
+
+            # Enviar stats al frontend
+            try:
+                total_chars = sum(len(m.get("content", "") or "") for m in messages)
+                prompt_tokens = max(0, total_chars // 4)
+                context_size = 8192
+                remaining_tokens = max(0, context_size - prompt_tokens)
+                yield f"data: {json.dumps({'type': 'stats', 'prompt_tokens': prompt_tokens, 'context_size': context_size, 'remaining_tokens': remaining_tokens})}\n\n"
+            except Exception:
+                pass
+
             yield "data: [DONE]\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"

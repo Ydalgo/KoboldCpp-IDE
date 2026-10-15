@@ -74,6 +74,19 @@
         .project-actions {
             display: none; gap: 2px;
         }
+        .project-arrow {
+            width: 12px; font-size: 9px; color: #888;
+            flex-shrink: 0; text-align: center;
+        }
+        .project-item.expanded > .project-row .project-arrow { color: #4ec9b0; }
+        .project-count {
+            background: #3a3a3a; color: #aaa;
+            font-size: 10px; padding: 1px 6px;
+            border-radius: 8px; margin-right: 4px;
+        }
+        .project-item.active > .project-row .project-count {
+            background: #0e639c; color: #fff;
+        }
         .project-item:hover .project-actions { display: flex; }
         .proj-btn {
             background: transparent; border: none; color: #888;
@@ -204,6 +217,22 @@
         .msg.tool-call.tool-error { border-left-color: #f48771; }
         .msg.tool-call .args { color: #888; margin-left: 6px; }
         .msg.tool-call .tool-result { margin-left: 6px; }
+        .msg-footer {
+            display: flex; flex-direction: column; gap: 2px;
+            padding: 6px 10px;
+            font-size: 10.5px; color: #999;
+            font-family: ui-monospace, monospace;
+            background: #1a1a1a; border-radius: 4px;
+            align-self: flex-start; margin-bottom: 6px;
+            border: 1px solid #2a2a2a;
+            line-height: 1.5;
+            max-width: 95%;
+        }
+        .msg-footer-line {
+            display: flex; flex-wrap: wrap; gap: 12px;
+            align-items: center;
+        }
+        .msg-footer-line span { white-space: nowrap; }
         .input-area {
             padding: 8px; border-top: 1px solid #333;
             display: flex; gap: 6px;

@@ -5,6 +5,7 @@ let currentSession = null;      // Objeto sesión completo (con project info)
 let currentProject = null;      // Objeto proyecto activo
 let allProjects = [];           // Lista de proyectos
 let allSessions = [];           // Lista de sesiones
+let expandedProjects = new Set();  // IDs de proyectos expandidos
 let isStreaming = false;
 let editor = null;
 let openTabs = [];
@@ -403,11 +404,21 @@ function renderProjects() {
         item.className = 'project-item';
         item.dataset.projectId = p.id;
         const isActive = currentProject && currentProject.id === p.id;
+        const isExpanded = expandedProjects.has(p.id);
+        
+        // Contar sesiones del proyecto
+        const sessions = allSessions.filter(s => s.project_id === p.id);
+        const sessionCount = sessions.length;
+
+        // Flecha de expansión
+        const arrow = isExpanded ? '▼' : '▶';
 
         item.innerHTML = `
             <div class="project-row">
+                <span class="project-arrow">${arrow}</span>
                 <span class="project-color" style="background: ${escapeHtml(p.color || '#4ec9b0')}"></span>
                 <span class="project-name">${escapeHtml(p.name)}</span>
+                <span class="project-count">${sessionCount}</span>
                 <span class="project-actions">
                     <button class="proj-btn" onclick="event.stopPropagation(); editProject(${p.id})" title="Editar">✏️</button>
                     <button class="proj-btn" onclick="event.stopPropagation(); deleteProject(${p.id})" title="Borrar">×</button>
@@ -416,12 +427,12 @@ function renderProjects() {
         `;
 
         if (isActive) item.classList.add('active');
+        if (isExpanded) item.classList.add('expanded');
 
-        item.onclick = () => selectProject(p.id);
+        item.onclick = () => toggleProject(p.id);
 
-        // Sesiones del proyecto (si está activo)
-        if (isActive) {
-            const sessions = allSessions.filter(s => s.project_id === p.id);
+        // Sesiones del proyecto (solo si está expandido)
+        if (isExpanded) {
             const sessionsContainer = document.createElement('div');
             sessionsContainer.className = 'project-sessions';
             for (const s of sessions) {
@@ -433,25 +444,43 @@ function renderProjects() {
         container.appendChild(item);
     }
 
-    // Sesiones sin proyecto (chat libre)
+    // Sesiones sin proyecto (chat libre) — siempre colapsado
     const orphanSessions = allSessions.filter(s => !s.project_id);
     if (orphanSessions.length) {
-        const container2 = document.createElement('div');
-        container2.className = 'project-item orphan';
-        container2.innerHTML = `
+        const hasOrphanOpen = expandedProjects.has(-1);
+        const item = document.createElement('div');
+        item.className = 'project-item orphan';
+        item.innerHTML = `
             <div class="project-row">
+                <span class="project-arrow">${hasOrphanOpen ? '▼' : '▶'}</span>
                 <span class="project-color" style="background: #666"></span>
                 <span class="project-name" style="color:#888">Chat libre</span>
+                <span class="project-count">${orphanSessions.length}</span>
             </div>
         `;
-        const sessionsContainer = document.createElement('div');
-        sessionsContainer.className = 'project-sessions';
-        for (const s of orphanSessions) {
-            sessionsContainer.appendChild(makeSessionItem(s));
+        item.onclick = () => toggleProject(-1);
+
+        if (hasOrphanOpen) {
+            const sessionsContainer = document.createElement('div');
+            sessionsContainer.className = 'project-sessions';
+            for (const s of orphanSessions) {
+                sessionsContainer.appendChild(makeSessionItem(s));
+            }
+            item.appendChild(sessionsContainer);
         }
-        container2.appendChild(sessionsContainer);
-        container.appendChild(container2);
+
+        container.appendChild(item);
     }
+}
+
+function toggleProject(projectId) {
+    if (expandedProjects.has(projectId)) {
+        expandedProjects.delete(projectId);
+    } else {
+        expandedProjects.clear();
+        expandedProjects.add(projectId);
+    }
+    renderProjects();
 }
 
 function makeSessionItem(s) {
@@ -486,6 +515,8 @@ async function selectProject(projectId) {
     const p = allProjects.find(x => x.id === projectId);
     if (!p) return;
     currentProject = p;
+    expandedProjects.clear();
+    expandedProjects.add(projectId);
     renderProjects();
 }
 
@@ -538,6 +569,13 @@ async function openSession(sessionId) {
         currentProject = currentSession.project_id
             ? allProjects.find(p => p.id === currentSession.project_id) || null
             : null;
+        // Expandir solo el proyecto de esta sesión
+        expandedProjects.clear();
+        if (currentSession.project_id) {
+            expandedProjects.add(currentSession.project_id);
+        } else {
+            expandedProjects.add(-1);
+        }
 
         // Reset editor
         openTabs = [];
@@ -548,8 +586,28 @@ async function openSession(sessionId) {
         // Render mensajes
         const container = document.getElementById('messages');
         container.innerHTML = '';
-        for (const m of data.messages) {
+        for (let i = 0; i < data.messages.length; i++) {
+            const m = data.messages[i];
             if (m.role === 'tool') continue;
+
+            // Si es un meta, buscamos el mensaje assistant anterior para adjuntar el footer
+            if (m.role === 'meta') {
+                try {
+                    const stats = JSON.parse(m.content);
+                    // Buscar el último mensaje del asistente y añadirle el footer
+                    const lastMsg = container.lastElementChild;
+                    if (lastMsg && lastMsg.classList.contains('assistant')) {
+                        const footer = document.createElement('div');
+                        footer.className = 'msg-footer';
+                        footer.dataset.stats = m.content;
+                        // El resto se pinta con renderFooterFromStats
+                        renderFooterFromStats(footer, stats, m.created_at);
+                        lastMsg.parentElement.insertBefore(footer, lastMsg.nextSibling);
+                    }
+                } catch (e) {}
+                continue;
+            }
+
             addMessage(m.role, m.content);
         }
 
@@ -853,7 +911,15 @@ async function send() {
     input.value = '';
     addMessage('user', text);
     const assistantDiv = addMessage('assistant', '');
+    const footer = document.createElement('div');
+    footer.className = 'msg-footer';
+    footer.style.display = 'none';
+    assistantDiv.parentElement.insertBefore(footer, assistantDiv.nextSibling);
+
     let assistantText = '';
+    const startTime = performance.now();
+    let firstTokenTime = null;
+    let contextInfo = null;
 
     isStreaming = true;
     document.getElementById('send').disabled = true;
@@ -891,6 +957,7 @@ async function send() {
                 try { evt = JSON.parse(payload); } catch { continue; }
 
                 if (evt.type === 'text') {
+                    if (firstTokenTime === null) firstTokenTime = performance.now();
                     assistantText += evt.content;
                     assistantDiv.textContent = assistantText;
                     scrollDown();
@@ -904,15 +971,105 @@ async function send() {
                     if (evt.name === 'write_file' || evt.name === 'run_command') {
                         refreshTree();
                     }
+                } else if (evt.type === 'stats') {
+                    contextInfo = evt;
                 } else if (evt.type === 'error') {
                     assistantDiv.className = 'msg error';
                     assistantDiv.textContent = 'Error: ' + evt.error;
                 }
             }
         }
+
+        // ── Calcular métricas ──────────────────────────────
+        const endTime = performance.now();
+
+        const totalMs = endTime - startTime;
+        const ttftMs = firstTokenTime ? (firstTokenTime - startTime) : totalMs;
+        const generationMs = firstTokenTime ? (endTime - firstTokenTime) : 0;
+
+        // Tokens (heurística ~4 chars/token en español)
+        const tokensGenerated = Math.max(1, Math.round(assistantText.length / 4));
+        const promptTokens = (contextInfo && contextInfo.prompt_tokens) || 0;
+
+        // Velocidades
+        const ttftSec = ttftMs / 1000;
+        const generationSec = generationMs / 1000;
+
+        const generationTps = generationSec > 0
+            ? (tokensGenerated / generationSec)
+            : 0;
+
+        const prefillTps = (ttftMs > 0 && promptTokens > 0)
+            ? (promptTokens / ttftSec)
+            : 0;
+
+        // Formateadores
+        function fmtTps(v) {
+            if (!v || v <= 0 || !isFinite(v)) return '—';
+            if (v >= 1000) return (v / 1000).toFixed(1) + 'k';
+            return v.toFixed(1);
+        }
+        function fmtNum(n) {
+            if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+            return String(n);
+        }
+        function fmtSec(s) {
+            if (!isFinite(s) || s < 0) return '—';
+            if (s < 1) return (s * 1000).toFixed(0) + 'ms';
+            return s.toFixed(2) + 's';
+        }
+
+        // Contexto
+        const contextSize = (contextInfo && contextInfo.context_size) || 8192;
+        const remaining = (contextInfo && contextInfo.remaining_tokens) != null
+            ? contextInfo.remaining_tokens
+            : Math.max(0, contextSize - promptTokens - tokensGenerated);
+
+        const pctFree = contextSize > 0 ? (remaining / contextSize) * 100 : 0;
+
+        // Color según disponibilidad
+        let barColor = '#4ec9b0';
+        if (pctFree < 60) barColor = '#cca700';
+        if (pctFree < 30) barColor = '#e07a00';
+        if (pctFree < 10) barColor = '#f48771';
+
+        // Hora
+        const now = new Date();
+        const hora = now.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+        // Barra de progreso (16 bloques)
+        const BAR_LEN = 16;
+        const filled = Math.max(0, Math.min(BAR_LEN, Math.round((remaining / contextSize) * BAR_LEN)));
+        const bar = '█'.repeat(filled) + '░'.repeat(BAR_LEN - filled);
+
+        // ── Guardar métricas en el backend ─────────────────
+        const statsToSave = {
+            timestamp: new Date().toISOString(),
+            ttft_sec: ttftSec,
+            generation_tps: generationTps,
+            prefill_tps: prefillTps,
+            tokens_generated: tokensGenerated,
+            prompt_tokens: promptTokens,
+            context_size: contextSize,
+            remaining_tokens: remaining,
+        };
+
+        try {
+            await fetch(`/api/sessions/${currentSession.session_id}/meta`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ stats: statsToSave }),
+            });
+        } catch (e) {
+            console.warn('No se pudieron guardar las métricas:', e);
+        }
+
+        // ── Renderizar footer ──────────────────────────────
+        renderFooterFromStats(footer, statsToSave);
     } catch (e) {
         assistantDiv.className = 'msg error';
         assistantDiv.textContent = 'Error: ' + e.message;
+        footer.style.display = 'none';
     } finally {
         isStreaming = false;
         document.getElementById('send').disabled = false;
@@ -1094,4 +1251,56 @@ async function init() {
 
     const input2 = document.getElementById('input');
     if (input2) input2.focus();
+}
+
+function renderFooterFromStats(footer, stats, timestampIso) {
+    const contextSize = stats.context_size || 8192;
+    const remaining = stats.remaining_tokens != null
+        ? stats.remaining_tokens
+        : Math.max(0, contextSize - (stats.prompt_tokens || 0));
+    const pctFree = contextSize > 0 ? (remaining / contextSize) * 100 : 0;
+
+    let barColor = '#4ec9b0';
+    if (pctFree < 60) barColor = '#cca700';
+    if (pctFree < 30) barColor = '#e07a00';
+    if (pctFree < 10) barColor = '#f48771';
+
+    // Hora: prioridad a stats.timestamp, luego a timestampIso
+    const ts = stats.timestamp || timestampIso;
+    const hora = ts
+        ? new Date(ts).toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+        : '—';
+
+    const BAR_LEN = 16;
+    const filled = Math.max(0, Math.min(BAR_LEN, Math.round((remaining / contextSize) * BAR_LEN)));
+    const bar = '█'.repeat(filled) + '░'.repeat(BAR_LEN - filled);
+
+    function fmtNum(n) {
+        if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+        return String(n);
+    }
+    function fmtTps(v) {
+        if (!v || v <= 0 || !isFinite(v)) return '—';
+        if (v >= 1000) return (v / 1000).toFixed(1) + 'k';
+        return v.toFixed(1);
+    }
+    function fmtSec(s) {
+        if (!isFinite(s) || s < 0 || s == null) return '—';
+        if (s < 1) return (s * 1000).toFixed(0) + 'ms';
+        return s.toFixed(2) + 's';
+    }
+
+    footer.style.display = 'flex';
+    footer.innerHTML = [
+        '<div class="msg-footer-line">',
+            '<span title="Hora de la respuesta">⏱ ' + hora + '</span>',
+            '<span title="Time to First Token">🚀 ' + fmtSec(stats.ttft_sec) + ' TTFT</span>',
+            '<span title="Velocidad de generación">⚡ ' + fmtTps(stats.generation_tps) + ' tok/s gen</span>',
+            '<span title="Velocidad de procesamiento del prompt">📖 ' + fmtTps(stats.prefill_tps) + ' tok/s prefill</span>',
+            '<span title="Tokens generados">🔤 ' + (stats.tokens_generated || '—') + ' tok</span>',
+        '</div>',
+        '<div class="msg-footer-line">',
+            '<span style="color:' + barColor + '">🎯 [' + bar + '] ' + pctFree.toFixed(0) + '% libre · ' + fmtNum(remaining) + '/' + fmtNum(contextSize) + '</span>',
+        '</div>'
+    ].join('');
 }
